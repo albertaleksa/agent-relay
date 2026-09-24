@@ -35,6 +35,28 @@ The `postgres` StatefulSet stores its database on a 1 Gi persistent volume.
 The Agent Relay Deployment waits for PostgreSQL and exposes `/ready` and
 `/health` probes before receiving Service traffic.
 
+## Run CI locally with act
+
+With Docker, kind, kubectl, and `act` installed, run the same test, build, and
+deployment workflow locally:
+
+```bash
+act push \
+  -P ubuntu-latest=catthehacker/ubuntu:act-latest \
+  --container-options '--network host' \
+  --var DEPLOY_TO_KIND=true \
+  --var KIND_CLUSTER_NAME=agent-relay
+```
+
+`act` mounts the Docker socket automatically. Host networking lets the job use
+the kind API endpoint exported on `127.0.0.1`. The workflow runs the starter
+tests and the real HTTP integration test against PostgreSQL first, then builds
+an immutable tag from the commit and workflow run, loads it into kind, and
+waits for the Deployment rollout. In GitHub Actions, configure a self-hosted
+runner with Docker and kind access and set the repository variable
+`DEPLOY_TO_KIND=true`; hosted runners cannot reach a kind cluster on your
+machine.
+
 Register two identities and send a task:
 
 ```bash

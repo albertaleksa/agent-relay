@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_REPOSITORY: agent-relay
+
+jobs:
+  unit-tests:
+    name: Starter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: uv sync --frozen
+      - run: uv run --frozen pytest -q test_agent_relay.py
+
+  postgres-integration:
+    name: PostgreSQL integration test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: uv sync --frozen
+      - name: Start Agent Relay against PostgreSQL
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@127.0.0.1:5432/agent_relay
+        run: |
+          uv run --frozen uvicorn main:app --host 0.0.0.0 --port 8000 \
+            >"$RUNNER_TEMP/agent-relay.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/agent-relay.pid"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/agent-relay.log"
+          exit 1
+      - name: Run real HTTP and database flow
+        env:
+          RELAY_INTEGRATION_BASE_URL: http://127.0.0.1:8000
+        run: uv run --frozen pytest -q test_compose_integration.py
+      - name: Stop Agent Relay
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/agent-relay.pid"; then
+            kill "$(cat "$RUNNER_TEMP/agent-relay.pid")" || true
+          fi
+
+  build-and-deploy:
+    name: Build image and deploy to kind
+    needs:
+      - unit-tests
+      - postgres-integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set immutable image tag
+        run: |
+          if test "${ACT:-false}" = "true"; then
+            RUN_VERSION="local-$(date +%s)"
+          else
+            RUN_VERSION="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          fi
+          echo "IMAGE_TAG=$IMAGE_REPOSITORY:${GITHUB_SHA:0:12}-$RUN_VERSION" >>"$GITHUB_ENV"
+      - name: Build image
+        run: >-
+          docker build
+          --platform linux/amd64
+          --provenance=false
+          --sbom=false
+          --tag "$IMAGE_TAG"
+          .
+      - name: Install kind and kubectl
+        if: ${{ vars.DEPLOY_TO_KIND == 'true' }}
+        run: |
+          KIND_VERSION=v0.33.0
+          KUBECTL_VERSION=v1.37.0
+          cd "$RUNNER_TEMP"
+
+          curl --fail --silent --show-error --location \
+            --output kind-linux-amd64 "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64"
+          curl --fail --silent --show-error --location \
+            --output kind.sha256sum "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64.sha256sum"
+          sha256sum --check kind.sha256sum
+          sudo install -m 0755 kind-linux-amd64 /usr/local/bin/kind
+
+          curl --fail --silent --show-error --location \
+            --output kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          curl --fail --silent --show-error --location \
+            --output kubectl.sha256 "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+      - name: Connect to existing kind cluster
+        if: ${{ vars.DEPLOY_TO_KIND == 'true' }}
+        env:
+          KIND_CLUSTER_NAME: ${{ vars.KIND_CLUSTER_NAME || 'agent-relay' }}
+        run: |
+          kind export kubeconfig --name "$KIND_CLUSTER_NAME"
+          kubectl cluster-info
+      - name: Load image and deploy
+        if: ${{ vars.DEPLOY_TO_KIND == 'true' }}
+        env:
+          KIND_CLUSTER_NAME: ${{ vars.KIND_CLUSTER_NAME || 'agent-relay' }}
+        run: |
+          kind load docker-image "$IMAGE_TAG" --name "$KIND_CLUSTER_NAME"
+          kubectl apply -k k8s
+          kubectl rollout status statefulset/postgres -n agent-relay --timeout=180s
+          kubectl set image deployment/agent-relay \
+            agent-relay="$IMAGE_TAG" \
+            -n agent-relay
+          kubectl rollout status deployment/agent-relay -n agent-relay --timeout=180s
+          kubectl wait --for=condition=Ready pods --all -n agent-relay --timeout=180s
+          kubectl get pods -n agent-relay

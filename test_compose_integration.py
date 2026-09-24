@@ -65,7 +65,7 @@ def test_two_agents_exchange_task_and_sender_reads_result():
 
         dashboard = client.get("/")
         assert dashboard.status_code == 200
-        assert "Agent Relay" in dashboard.text
+        assert "Agent Relay v2" in dashboard.text
 
         dashboard_tasks = client.get("/api/v1/tasks?direction=sent", headers=sender_headers)
         assert dashboard_tasks.status_code == 200
