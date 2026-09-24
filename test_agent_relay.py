@@ -1,9 +1,8 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests using the isolated SQLite backend.
 
 These tests intentionally exercise storage calls from multiple threads: that
-is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+verifies the SQLite fallback uses its BEGIN IMMEDIATE boundary rather than a
+process-local Python lock. Production uses PostgreSQL row locks.
 """
 
 from __future__ import annotations
@@ -41,6 +40,51 @@ def register(client: TestClient, name: str) -> tuple[dict, dict[str, str]]:
     assert response.status_code == 201
     data = response.json()
     return data, {"Authorization": f"Bearer {data['token']}"}
+
+
+def test_first_acceptance_scenario_sender_reads_completed_result():
+    with TestClient(main.app) as client:
+        _sender, sender_headers = register(client, "acceptance-sender")
+        recipient, recipient_headers = register(client, "acceptance-recipient")
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers={**sender_headers, "Idempotency-Key": "acceptance-scenario-1"},
+            json={"to": recipient["agent_id"], "input": "hello acceptance scenario"},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+        assert sent.json()["status"] == "queued"
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "acceptance-worker", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        assert claim.json()["task_id"] == task_id
+
+        completed = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={
+                "claim_token": claim.json()["claim_token"],
+                "output": "HELLO ACCEPTANCE SCENARIO",
+            },
+        )
+        assert completed.status_code == 200
+        assert completed.json() == {"task_id": task_id, "status": "completed"}
+
+        sender_view = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert sender_view.status_code == 200
+        assert sender_view.json()["status"] == "completed"
+        assert sender_view.json()["output"] == "HELLO ACCEPTANCE SCENARIO"
+
+        with db_session() as db:
+            persisted = db.get(Task, task_id)
+            assert persisted is not None
+            assert persisted.status == "completed"
+            assert persisted.output == "HELLO ACCEPTANCE SCENARIO"
 
 
 def test_protocol_idempotency_terminal_retry_and_auth_boundary():

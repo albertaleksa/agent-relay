@@ -1,22 +1,39 @@
-# Agent Relay (SQLite starter)
+# Agent Relay
 
 Agent Relay is a small FastAPI service for registering agents, delivering one
-task at a time, and recording results. The local starter is self-contained:
-SQLite persists the queue and attempts, while workers execute tasks on their own
-machines. The included worker deterministically returns `input.upper()`.
+task at a time, and recording results. PostgreSQL persists the queue and
+attempts, while workers execute tasks on their own machines. The included
+worker deterministically returns `input.upper()`.
 
 ## Run it
 
 ```bash
-uv sync
-uv run uvicorn main:app --reload
+docker compose up --build
 ```
 
 Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
-database is `./agent-relay.db`; set `RELAY_DATABASE_URL` to use another SQLite
-file. `GET /health` is a liveness check and `GET /ready` verifies database
-connectivity and schema (it queries the real tables, so a wiped volume
-reports not-ready instead of passing with zero tables).
+Compose network connects the API to the `postgres` service and persists data in
+the `postgres-data` volume. `GET /health` is a liveness check and `GET /ready`
+verifies database connectivity and schema (it queries the real tables, so a
+missing schema reports not-ready instead of passing with zero tables).
+
+## Run it in kind
+
+Build and load the application image, then apply the Kubernetes manifests:
+
+```bash
+docker build --platform linux/amd64 --provenance=false --sbom=false \
+  -t agent-relay:local .
+kind create cluster --name agent-relay
+kind load docker-image agent-relay:local --name agent-relay
+kubectl apply -k k8s
+kubectl wait --for=condition=Ready pods --all -n agent-relay --timeout=180s
+kubectl port-forward -n agent-relay service/agent-relay 8000:8000
+```
+
+The `postgres` StatefulSet stores its database on a 1 Gi persistent volume.
+The Agent Relay Deployment waits for PostgreSQL and exposes `/ready` and
+`/health` probes before receiving Service traffic.
 
 Register two identities and send a task:
 
@@ -67,13 +84,11 @@ uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id la
 
 ## Storage and delivery behavior
 
-`database.py` contains SQLAlchemy models, SQLite WAL setup, and the isolated
-`BEGIN IMMEDIATE` transaction helper. `storage.py` contains task/claim/recovery
-operations; routes and request models are kept in `main.py` and `schemas.py`.
-SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
-serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+`database.py` contains the SQLAlchemy models and transaction setup. `storage.py`
+contains task, claim, and recovery operations; routes and request models are in
+`main.py` and `schemas.py`. PostgreSQL transactions and
+`FOR UPDATE SKIP LOCKED` make concurrent claims safe across API and worker
+processes. SQLite remains available as the isolated test backend.
 
 Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
 an active lease. A completion or failure must include the recipient's bearer
@@ -89,14 +104,13 @@ asset serving:
 
 ```bash
 uv run pytest -q
+
+RELAY_INTEGRATION_BASE_URL=http://127.0.0.1:8000 \
+  uv run pytest -q test_compose_integration.py
 ```
 
 Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
-don't reset your dev server's `./agent-relay.db`. The fixture drops and
-recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
-the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
-running tests against another database.
-
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+do not alter the Compose database. The fixture drops and recreates all tables
+on whatever `RELAY_DATABASE_URL` points at, so never point the unit suite at a
+database containing data you need. The Compose integration test uses only the
+public HTTP API and is safe to rerun against the development stack.

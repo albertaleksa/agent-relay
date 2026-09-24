@@ -1,9 +1,7 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+PostgreSQL is the production runtime. SQLite remains supported for the isolated
+test suite and lightweight local experiments.
 """
 
 from __future__ import annotations
@@ -19,7 +17,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return (
+        os.getenv("RELAY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg://agent_relay:agent_relay@localhost:5432/agent_relay"
+    )
 
 
 def positive_int(name: str, default: int) -> int:
@@ -44,7 +46,7 @@ def utcnow() -> datetime:
 
 
 def as_db_time(value: datetime) -> datetime:
-    """SQLite's DateTime implementation is most portable with naive UTC."""
+    """Store UTC consistently across PostgreSQL and the SQLite test backend."""
 
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -134,8 +136,9 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+IS_SQLITE = _is_sqlite(DATABASE_URL)
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
     if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
         from sqlalchemy.pool import StaticPool
@@ -144,7 +147,7 @@ if _is_sqlite(DATABASE_URL):
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
@@ -177,14 +180,17 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run an atomic storage operation using the configured database.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    PostgreSQL operations acquire row locks in their queries. SQLite does not
+    support those locks, so ``BEGIN IMMEDIATE`` preserves its existing
+    process-safe writer serialization for tests and local experiments.
     """
+
+    if not IS_SQLITE:
+        with db_session() as db:
+            yield db
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -205,13 +211,15 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    query = (
+        select(Attempt)
+        .join(Task, Task.id == Attempt.task_id)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if not IS_SQLITE:
+        query = query.with_for_update(of=(Task, Attempt), skip_locked=True)
+    expired = list(db.scalars(query))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
@@ -245,6 +253,7 @@ __all__ = [
     "Base",
     "DATABASE_URL",
     "DEFAULT_PAGE_SIZE",
+    "IS_SQLITE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",
     "MAX_BODY_BYTES",
